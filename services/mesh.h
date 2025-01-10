@@ -90,6 +90,11 @@ struct mesh_area {
 	/** rbtree of all current queries (mesh_state.node)*/
 	rbtree_type all;
 
+	/** number of queries for unbound's auth_zones, upstream query */
+	size_t num_query_authzone_up;
+	/** number of queries for unbound's auth_zones, downstream answers */
+	size_t num_query_authzone_down;
+
 	/** count of the total number of mesh_reply entries */
 	size_t num_reply_addrs;
 	/** count of the number of mesh_states that have mesh_replies 
@@ -114,6 +119,8 @@ struct mesh_area {
 	size_t stats_dropped;
 	/** stats, number of expired replies sent */
 	size_t ans_expired;
+	/** stats, number of cached replies from cachedb */
+	size_t ans_cachedb;
 	/** number of replies sent */
 	size_t replies_sent;
 	/** sum of waiting times for the replies */
@@ -130,6 +137,10 @@ struct mesh_area {
 	size_t ans_nodata;
 	/** (extended stats) type of applied RPZ action */
 	size_t rpz_action[UB_STATS_RPZ_ACTION_NUM];
+	/** stats, number of queries removed due to discard-timeout */
+	size_t num_queries_discard_timeout;
+	/** stats, number of queries removed due to wait-limit */
+	size_t num_queries_wait_limit;
 
 	/** backup of query if other operations recurse and need the
 	 * network buffers */
@@ -335,13 +346,13 @@ int mesh_new_callback(struct mesh_area* mesh, struct query_info* qinfo,
  * @param leeway: TTL leeway what to expire earlier for this update.
  * @param rpz_passthru: if true, the rpz passthru was previously found and
  * 	further rpz processing is stopped.
- * @param rep: comm_reply for the client; to be used when subnet is enabled.
+ * @param addr: sockaddr_storage for the client; to be used with subnet.
  * @param opt_list: edns opt_list from the client; to be used when subnet is
  *	enabled.
  */
 void mesh_new_prefetch(struct mesh_area* mesh, struct query_info* qinfo,
 	uint16_t qflags, time_t leeway, int rpz_passthru,
-	struct comm_reply* rep, struct edns_option* opt_list);
+	struct sockaddr_storage* addr, struct edns_option* opt_list);
 
 /**
  * Handle new event from the wire. A serviced query has returned.
@@ -477,14 +488,6 @@ void mesh_state_delete(struct module_qstate* qstate);
 struct mesh_state* mesh_state_create(struct module_env* env,
 	struct query_info* qinfo, struct respip_client_info* cinfo,
 	uint16_t qflags, int prime, int valrec);
-
-/**
- * Check if the mesh state is unique.
- * A unique mesh state uses it's unique member to point to itself, else NULL.
- * @param mstate: mesh state to check.
- * @return true if the mesh state is unique, false otherwise.
- */
-int mesh_state_is_unique(struct mesh_state* mstate);
 
 /**
  * Make a mesh state unique.
@@ -679,10 +682,28 @@ void mesh_serve_expired_callback(void* arg);
  * the same behavior as when replying from cache.
  * @param qstate: the module qstate.
  * @param lookup_qinfo: the query info to look for in the cache.
+ * @param is_expired: set if the cached answer is expired.
  * @return dns_msg if a cached answer was found, otherwise NULL.
  */
 struct dns_msg*
 mesh_serve_expired_lookup(struct module_qstate* qstate,
-	struct query_info* lookup_qinfo);
+	struct query_info* lookup_qinfo, int* is_expired);
+
+/**
+ * See if the mesh has space for more queries. You can allocate queries
+ * anyway, but this checks for the allocated space.
+ * @param mesh: mesh area.
+ * @return true if the query list is full.
+ * 	It checks the number of all queries, not just number of reply states,
+ * 	that have a client address. So that spawned queries count too,
+ * 	that were created by the iterator, or other modules.
+ */
+int mesh_jostle_exceeded(struct mesh_area* mesh);
+
+/**
+ * Give the serve expired responses.
+ * @param mstate: mesh state for query that has serve_expired_data.
+ */
+void mesh_respond_serve_expired(struct mesh_state* mstate);
 
 #endif /* SERVICES_MESH_H */

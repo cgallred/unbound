@@ -58,6 +58,8 @@ struct ub_randstate;
 struct daemon_remote;
 struct respip_set;
 struct shm_main_info;
+struct doq_table;
+struct cookie_secrets;
 
 #include "dnstap/dnstap_config.h"
 #ifdef USE_DNSTAP
@@ -97,10 +99,16 @@ struct daemon {
 	struct daemon_remote* rc;
 	/** ssl context for listening to dnstcp over ssl, and connecting ssl */
 	void* listen_sslctx, *connect_sslctx;
+	/** ssl context for listening to quic */
+	void* quic_sslctx;
 	/** num threads allocated */
 	int num;
+	/** num threads allocated in the previous config or 0 at first */
+	int old_num;
 	/** the worker entries */
 	struct worker** workers;
+	/** per-worker allocation cache */
+	struct alloc_cache **worker_allocs;
 	/** do we need to exit unbound (or is it only a reload?) */
 	int need_to_exit;
 	/** master random table ; used for port div between threads on reload*/
@@ -111,8 +119,12 @@ struct daemon {
 	struct module_env* env;
 	/** stack of module callbacks */
 	struct module_stack mods;
+	/** The module stack has been inited */
+	int mods_inited;
 	/** access control, which client IPs are allowed to connect */
 	struct acl_list* acl;
+	/** access control, which interfaces are allowed to connect */
+	struct acl_list* acl_interface;
 	/** TCP connection limit, limit connections from client IPs */
 	struct tcl_list* tcl;
 	/** local authority zones */
@@ -138,6 +150,12 @@ struct daemon {
 	/** the dnscrypt environment */
 	struct dnsc_env* dnscenv;
 #endif
+	/** the doq connection table */
+	struct doq_table* doq_table;
+	/** reuse existing cache on reload if other conditions allow it. */
+	int reuse_cache;
+	/** the EDNS cookie secrets from the cookie-secret-file */
+	struct cookie_secrets* cookie_secrets;
 };
 
 /**
@@ -153,6 +171,15 @@ struct daemon* daemon_init(void);
  * @return: false on error.
  */
 int daemon_open_shared_ports(struct daemon* daemon);
+
+/**
+ * Do daemon setup that needs privileges
+ * like opening privileged ports or opening device files.
+ * The cfg member pointer must have been set for the daemon.
+ * @param daemon: the daemon.
+ * @return: false on error.
+ */
+int daemon_privileged(struct daemon* daemon);
 
 /**
  * Fork workers and start service.
