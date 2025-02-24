@@ -48,6 +48,7 @@
 #include "util/data/msgparse.h"
 #include "util/data/dname.h"
 #include "util/rbtree.h"
+#include "util/rfc_1982.h"
 #include "util/module.h"
 #include "util/net_help.h"
 #include "util/regional.h"
@@ -77,6 +78,9 @@
 #ifdef HAVE_OPENSSL_ENGINE_H
 #include <openssl/engine.h>
 #endif
+
+/** Maximum number of RRSIG validations for an RRset. */
+#define MAX_VALIDATE_RRSIGS 8
 
 /** return number of rrs in an rrset */
 static size_t
@@ -513,31 +517,114 @@ size_t algo_needs_num_missing(struct algo_needs* n)
 
 int algo_needs_missing(struct algo_needs* n)
 {
-	int i;
-	/* first check if a needed algo was bogus - report that */
-	for(i=0; i<ALGO_NEEDS_MAX; i++)
+	int i, miss = -1;
+	/* check if a needed algo was bogus - report that;
+	 * check the first missing algo - report that;
+	 * or return 0 */
+	for(i=0; i<ALGO_NEEDS_MAX; i++) {
 		if(n->needs[i] == 2)
 			return 0;
-	/* now check which algo is missing */
-	for(i=0; i<ALGO_NEEDS_MAX; i++)
-		if(n->needs[i] == 1)
-			return i;
+		if(n->needs[i] == 1 && miss == -1)
+			miss = i;
+	}
+	if(miss != -1) return miss;
 	return 0;
 }
 
+/**
+ * verify rrset, with dnskey rrset, for a specific rrsig in rrset
+ * @param env: module environment, scratch space is used.
+ * @param ve: validator environment, date settings.
+ * @param now: current time for validation (can be overridden).
+ * @param rrset: to be validated.
+ * @param dnskey: DNSKEY rrset, keyset to try.
+ * @param sig_idx: which signature to try to validate.
+ * @param sortree: reused sorted order. Stored in region. Pass NULL at start,
+ * 	and for a new rrset.
+ * @param reason: if bogus, a string returned, fixed or alloced in scratch.
+ * @param reason_bogus: EDE (RFC8914) code paired with the reason of failure.
+ * @param section: section of packet where this rrset comes from.
+ * @param qstate: qstate with region.
+ * @param numverified: incremented when the number of RRSIG validations
+ * 	increases.
+ * @return secure if any key signs *this* signature. bogus if no key signs it,
+ *	unchecked on error, or indeterminate if all keys are not supported by
+ *	the crypto library (openssl3+ only).
+ */
 static enum sec_status
 dnskeyset_verify_rrset_sig(struct module_env* env, struct val_env* ve,
 	time_t now, struct ub_packed_rrset_key* rrset,
 	struct ub_packed_rrset_key* dnskey, size_t sig_idx,
 	struct rbtree_type** sortree,
 	char** reason, sldns_ede_code *reason_bogus,
-	sldns_pkt_section section, struct module_qstate* qstate);
+	sldns_pkt_section section, struct module_qstate* qstate,
+	int* numverified)
+{
+	/* find matching keys and check them */
+	enum sec_status sec = sec_status_bogus;
+	uint16_t tag = rrset_get_sig_keytag(rrset, sig_idx);
+	int algo = rrset_get_sig_algo(rrset, sig_idx);
+	size_t i, num = rrset_get_count(dnskey);
+	size_t numchecked = 0;
+	size_t numindeterminate = 0;
+	int buf_canon = 0;
+	verbose(VERB_ALGO, "verify sig %d %d", (int)tag, algo);
+	if(!dnskey_algo_id_is_supported(algo)) {
+		if(reason_bogus)
+			*reason_bogus = LDNS_EDE_UNSUPPORTED_DNSKEY_ALG;
+		verbose(VERB_QUERY, "verify sig: unknown algorithm");
+		return sec_status_insecure;
+	}
+
+	for(i=0; i<num; i++) {
+		/* see if key matches keytag and algo */
+		if(algo != dnskey_get_algo(dnskey, i) ||
+			tag != dnskey_calc_keytag(dnskey, i))
+			continue;
+		numchecked ++;
+		(*numverified)++;
+
+		/* see if key verifies */
+		sec = dnskey_verify_rrset_sig(env->scratch,
+			env->scratch_buffer, ve, now, rrset, dnskey, i,
+			sig_idx, sortree, &buf_canon, reason, reason_bogus,
+			section, qstate);
+		if(sec == sec_status_secure)
+			return sec;
+		else if(sec == sec_status_indeterminate)
+			numindeterminate ++;
+		if(*numverified > MAX_VALIDATE_RRSIGS) {
+			*reason = "too many RRSIG validations";
+			if(reason_bogus)
+				*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
+			verbose(VERB_ALGO, "verify sig: too many RRSIG validations");
+			return sec_status_bogus;
+		}
+	}
+	if(numchecked == 0) {
+		*reason = "signatures from unknown keys";
+		if(reason_bogus)
+			*reason_bogus = LDNS_EDE_DNSKEY_MISSING;
+		verbose(VERB_QUERY, "verify: could not find appropriate key");
+		return sec_status_bogus;
+	}
+	if(numindeterminate == numchecked) {
+		*reason = "unsupported algorithm by crypto library";
+		if(reason_bogus)
+			*reason_bogus = LDNS_EDE_UNSUPPORTED_DNSKEY_ALG;
+		verbose(VERB_ALGO, "verify sig: unsupported algorithm by "
+			"crypto library");
+		return sec_status_indeterminate;
+	}
+	return sec_status_bogus;
+}
 
 enum sec_status 
 dnskeyset_verify_rrset(struct module_env* env, struct val_env* ve,
 	struct ub_packed_rrset_key* rrset, struct ub_packed_rrset_key* dnskey,
 	uint8_t* sigalg, char** reason, sldns_ede_code *reason_bogus,
-	sldns_pkt_section section, struct module_qstate* qstate)
+	sldns_pkt_section section, struct module_qstate* qstate, int* verified,
+	char* reasonbuf, size_t reasonlen)
 {
 	enum sec_status sec;
 	size_t i, num;
@@ -545,6 +632,7 @@ dnskeyset_verify_rrset(struct module_env* env, struct val_env* ve,
 	/* make sure that for all DNSKEY algorithms there are valid sigs */
 	struct algo_needs needs;
 	int alg;
+	*verified = 0;
 
 	num = rrset_get_sigcount(rrset);
 	if(num == 0) {
@@ -569,7 +657,7 @@ dnskeyset_verify_rrset(struct module_env* env, struct val_env* ve,
 	for(i=0; i<num; i++) {
 		sec = dnskeyset_verify_rrset_sig(env, ve, *env->now, rrset, 
 			dnskey, i, &sortree, reason, reason_bogus,
-			section, qstate);
+			section, qstate, verified);
 		/* see which algorithm has been fixed up */
 		if(sec == sec_status_secure) {
 			if(!sigalg)
@@ -581,12 +669,20 @@ dnskeyset_verify_rrset(struct module_env* env, struct val_env* ve,
 			algo_needs_set_bogus(&needs,
 				(uint8_t)rrset_get_sig_algo(rrset, i));
 		}
+		if(*verified > MAX_VALIDATE_RRSIGS) {
+			verbose(VERB_QUERY, "rrset failed to verify, too many RRSIG validations");
+			*reason = "too many RRSIG validations";
+			if(reason_bogus)
+				*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
+			return sec_status_bogus;
+		}
 	}
 	if(sigalg && (alg=algo_needs_missing(&needs)) != 0) {
 		verbose(VERB_ALGO, "rrset failed to verify: "
 			"no valid signatures for %d algorithms",
 			(int)algo_needs_num_missing(&needs));
-		algo_needs_reason(env, alg, reason, "no signatures");
+		algo_needs_reason(alg, reason, "no signatures", reasonbuf,
+			reasonlen);
 	} else {
 		verbose(VERB_ALGO, "rrset failed to verify: "
 			"no valid signatures");
@@ -594,31 +690,31 @@ dnskeyset_verify_rrset(struct module_env* env, struct val_env* ve,
 	return sec_status_bogus;
 }
 
-void algo_needs_reason(struct module_env* env, int alg, char** reason, char* s)
+void algo_needs_reason(int alg, char** reason, char* s, char* reasonbuf,
+	size_t reasonlen)
 {
-	char buf[256];
 	sldns_lookup_table *t = sldns_lookup_by_id(sldns_algorithms, alg);
 	if(t&&t->name)
-		snprintf(buf, sizeof(buf), "%s with algorithm %s", s, t->name);
-	else	snprintf(buf, sizeof(buf), "%s with algorithm ALG%u", s,
+		snprintf(reasonbuf, reasonlen, "%s with algorithm %s", s,
+			t->name);
+	else	snprintf(reasonbuf, reasonlen, "%s with algorithm ALG%u", s,
 			(unsigned)alg);
-	*reason = regional_strdup(env->scratch, buf);
-	if(!*reason)
-		*reason = s;
+	*reason = reasonbuf;
 }
 
-enum sec_status 
+enum sec_status
 dnskey_verify_rrset(struct module_env* env, struct val_env* ve,
         struct ub_packed_rrset_key* rrset, struct ub_packed_rrset_key* dnskey,
 	size_t dnskey_idx, char** reason, sldns_ede_code *reason_bogus,
 	sldns_pkt_section section, struct module_qstate* qstate)
 {
 	enum sec_status sec;
-	size_t i, num, numchecked = 0;
+	size_t i, num, numchecked = 0, numindeterminate = 0;
 	rbtree_type* sortree = NULL;
 	int buf_canon = 0;
 	uint16_t tag = dnskey_calc_keytag(dnskey, dnskey_idx);
 	int algo = dnskey_get_algo(dnskey, dnskey_idx);
+	int numverified = 0;
 
 	num = rrset_get_sigcount(rrset);
 	if(num == 0) {
@@ -642,57 +738,30 @@ dnskey_verify_rrset(struct module_env* env, struct val_env* ve,
 		if(sec == sec_status_secure)
 			return sec;
 		numchecked ++;
+		numverified ++;
+		if(sec == sec_status_indeterminate)
+			numindeterminate ++;
+		if(numverified > MAX_VALIDATE_RRSIGS) {
+			verbose(VERB_QUERY, "rrset failed to verify, too many RRSIG validations");
+			*reason = "too many RRSIG validations";
+			if(reason_bogus)
+				*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
+			return sec_status_bogus;
+		}
 	}
-	verbose(VERB_ALGO, "rrset failed to verify: all signatures are bogus");
-	if(!numchecked) *reason = "signature missing";
-	return sec_status_bogus;
-}
-
-static enum sec_status
-dnskeyset_verify_rrset_sig(struct module_env* env, struct val_env* ve,
-	time_t now, struct ub_packed_rrset_key* rrset,
-	struct ub_packed_rrset_key* dnskey, size_t sig_idx,
-	struct rbtree_type** sortree,
-	char** reason, sldns_ede_code *reason_bogus,
-	sldns_pkt_section section, struct module_qstate* qstate)
-{
-	/* find matching keys and check them */
-	enum sec_status sec = sec_status_bogus;
-	uint16_t tag = rrset_get_sig_keytag(rrset, sig_idx);
-	int algo = rrset_get_sig_algo(rrset, sig_idx);
-	size_t i, num = rrset_get_count(dnskey);
-	size_t numchecked = 0;
-	int buf_canon = 0;
-	verbose(VERB_ALGO, "verify sig %d %d", (int)tag, algo);
-	if(!dnskey_algo_id_is_supported(algo)) {
+	if(!numchecked) {
+		*reason = "signature for expected key and algorithm missing";
+		if(reason_bogus)
+			*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
+	} else if(numchecked == numindeterminate) {
+		verbose(VERB_ALGO, "rrset failed to verify due to algorithm "
+			"refusal by cryptolib");
 		if(reason_bogus)
 			*reason_bogus = LDNS_EDE_UNSUPPORTED_DNSKEY_ALG;
-		verbose(VERB_QUERY, "verify sig: unknown algorithm");
-		return sec_status_insecure;
+		*reason = "algorithm refused by cryptolib";
+		return sec_status_indeterminate;
 	}
-
-	for(i=0; i<num; i++) {
-		/* see if key matches keytag and algo */
-		if(algo != dnskey_get_algo(dnskey, i) ||
-			tag != dnskey_calc_keytag(dnskey, i))
-			continue;
-		numchecked ++;
-
-		/* see if key verifies */
-		sec = dnskey_verify_rrset_sig(env->scratch,
-			env->scratch_buffer, ve, now, rrset, dnskey, i,
-			sig_idx, sortree, &buf_canon, reason, reason_bogus,
-			section, qstate);
-		if(sec == sec_status_secure)
-			return sec;
-	}
-	if(numchecked == 0) {
-		*reason = "signatures from unknown keys";
-		if(reason_bogus)
-			*reason_bogus = LDNS_EDE_DNSKEY_MISSING;
-		verbose(VERB_QUERY, "verify: could not find appropriate key");
-		return sec_status_bogus;
-	}
+	verbose(VERB_ALGO, "rrset failed to verify: all signatures are bogus");
 	return sec_status_bogus;
 }
 
@@ -1340,44 +1409,6 @@ sigdate_error(const char* str, int32_t expi, int32_t incep, int32_t now)
 	} else
 		log_info("%s expi=%u incep=%u now=%u", str, (unsigned)expi, 
 			(unsigned)incep, (unsigned)now);
-}
-
-/** RFC 1982 comparison, uses unsigned integers, and tries to avoid
- * compiler optimization (eg. by avoiding a-b<0 comparisons),
- * this routine matches compare_serial(), for SOA serial number checks */
-static int
-compare_1982(uint32_t a, uint32_t b)
-{
-	/* for 32 bit values */
-        const uint32_t cutoff = ((uint32_t) 1 << (32 - 1));
-
-        if (a == b) {
-                return 0;
-        } else if ((a < b && b - a < cutoff) || (a > b && a - b > cutoff)) {
-                return -1;
-        } else {
-                return 1;
-        }
-}
-
-/** if we know that b is larger than a, return the difference between them,
- * that is the distance between them. in RFC1982 arith */
-static uint32_t
-subtract_1982(uint32_t a, uint32_t b)
-{
-	/* for 32 bit values */
-        const uint32_t cutoff = ((uint32_t) 1 << (32 - 1));
-
-	if(a == b)
-		return 0;
-	if(a < b && b - a < cutoff) {
-		return b-a;
-	}
-	if(a > b && a - b > cutoff) {
-		return ((uint32_t)0xffffffff) - (a-b-1);
-	}
-	/* wrong case, b smaller than a */
-	return 0;
 }
 
 /** check rrsig dates */
